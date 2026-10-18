@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aegis - Enterprise Security Dashboard</title>
+    <style>
+        :root {
+            --bg-main: #0b0f19;
+            --bg-sidebar: #111827;
+            --bg-card: #1f2937;
+            --border-color: #374151;
+            --accent-glow: #38bdf8;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+        }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg-main); color: var(--text-main); margin: 0; display: flex; height: 100vh; overflow: hidden; }
+        
+        .sidebar { width: 280px; background: linear-gradient(180deg, #111827 0%, #030712 100%); border-right: 1px solid var(--border-color); display: flex; flex-direction: column; box-shadow: 4px 0 20px rgba(0,0,0,0.4); }
+        .sidebar-header { padding: 25px 20px; font-size: 22px; font-weight: 800; color: #38bdf8; border-bottom: 1px solid var(--border-color); display: flex; align-items: center; gap: 10px; }
+        .sidebar-menu { list-style: none; padding: 15px; margin: 0; flex: 1; display: flex; flex-direction: column; gap: 8px; }
+        .sidebar-menu li { padding: 14px 18px; cursor: pointer; color: var(--text-muted); font-weight: 600; border-radius: 8px; transition: all 0.3s ease; display: flex; align-items: center; gap: 12px; }
+        .sidebar-menu li:hover { background: rgba(56, 189, 248, 0.1); color: #38bdf8; transform: translateX(4px); }
+        .sidebar-menu li.active { background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%); color: #fff; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.4); }
+
+        .main-content { flex: 1; display: flex; flex-direction: column; overflow-y: auto; background: var(--bg-main); }
+        .topbar { background: var(--bg-sidebar); padding: 18px 30px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 10px rgba(0,0,0,0.2); }
+        .content-area { padding: 35px; flex: 1; }
+        
+        h1, h2 { color: #38bdf8; margin-top: 0; font-weight: 700; }
+        .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        
+        table { width: 100%; border-collapse: collapse; background: var(--bg-card); border-radius: 10px; overflow: hidden; margin-bottom: 30px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); border: 1px solid var(--border-color); }
+        th, td { padding: 14px 18px; text-align: left; border-bottom: 1px solid var(--border-color); font-size: 14px; }
+        th { background: #111827; color: #38bdf8; font-weight: 600; text-transform: uppercase; font-size: 12px; letter-spacing: 0.8px; }
+        
+        .btn { padding: 9px 16px; background: #0284c7; border: none; border-radius: 6px; color: #fff; cursor: pointer; font-weight: 600; transition: background 0.2s, transform 0.1s; }
+        .btn:hover { background: #0ea5e9; transform: translateY(-1px); }
+        .btn-danger { background: #dc2626; }
+        .btn-danger:hover { background: #ef4444; }
+        .btn-success { background: #16a34a; }
+        .btn-success:hover { background: #22c55e; }
+        .logout-btn { background: #374151; color: #f3f4f6; }
+        .logout-btn:hover { background: #4b5563; }
+
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); justify-content: center; align-items: center; z-index: 100; }
+        .modal-content { background: var(--bg-card); padding: 30px; border-radius: 12px; width: 400px; border: 1px solid var(--border-color); box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--text-muted); }
+        input, select { width: 100%; padding: 10px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-main); color: #fff; font-size: 14px; box-sizing: border-box; }
+        input:focus { outline: none; border-color: #38bdf8; }
+        input[type="checkbox"] { width: 20px; height: 20px; cursor: pointer; accent-color: #0284c7; }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="sidebar-header">🛡️ Aegis Security</div>
+        <ul class="sidebar-menu">
+            <li class="active" onclick="switchTab('files')">📁 Secure Files</li>
+            <li id="usersTab" style="display:none;" onclick="switchTab('users')">👥 User Management</li>
+            <li id="permsTab" style="display:none;" onclick="switchTab('perms')">🔑 File Permissions</li>
+            <li id="auditTab" style="display:none;" onclick="switchTab('audit')">📊 Audit Logs</li>
+            <li onclick="logout()" style="margin-top: auto; color: #fca5a5;">🚪 Sign Out</li>
+        </ul>
+    </div>
+
+    <div class="main-content">
+        <div class="topbar">
+            <div>Welcome, <span id="userDisplay" style="font-weight: bold; color: #38bdf8;"></span> (<span id="roleDisplay"></span>)</div>
+            <button class="btn logout-btn" onclick="logout()">Sign Out</button>
+        </div>
+
+        <div class="content-area">
+            <!-- Files Section -->
+            <div id="section-files">
+                <div class="section-header">
+                    <div>
+                        <h2>Protected Enterprise Files</h2>
+                        <p style="color: var(--text-muted); margin:0;">Enterprise files repository.</p>
+                    </div>
+                    <button id="uploadFileBtn" class="btn btn-success" style="display:none;" onclick="openFileModal()">+ Upload File</button>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Filename</th>
+                            <th>Size (KB)</th>
+                            <th>SHA-256 Checksum</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="filesTableBody"></tbody>
+                </table>
+            </div>
+
+            <!-- Users Section -->
+            <div id="section-users" style="display:none;">
+                <div class="section-header">
+                    <div>
+                        <h2>Authorized Users & Emails</h2>
+                        <p style="color: var(--text-muted); margin:0;">Manage employees and administrative accounts.</p>
+                    </div>
+                    <button class="btn btn-success" onclick="openUserModal()">+ Add User</button>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Username</th>
+                            <th>Role</th>
+                            <th>Email Address</th>
+                            <th>Status</th>
+                            <th>Management</th>
+                        </tr>
+                    </thead>
+                    <tbody id="usersTableBody"></tbody>
+                </table>
+            </div>
+
+            <!-- Permissions Section -->
+            <div id="section-perms" style="display:none;">
+                <h2>File Access Permissions Matrix</h2>
+                <p style="color: var(--text-muted);">Check or uncheck to grant or revoke file read access for employees.</p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Username</th>
+                            <th>File Name</th>
+                            <th>Access Status</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="permsTableBody"></tbody>
+                </table>
+            </div>
+
+            <!-- Audit Logs Section -->
+            <div id="section-audit" style="display:none;">
+                <h2>System Audit Trail</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Timestamp</th>
+                            <th>User</th>
+                            <th>Action</th>
+                            <th>Status</th>
+                            <th>Target/File</th>
+                        </tr>
+                    </thead>
+                    <tbody id="auditTableBody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modals -->
+    <div id="userModal" class="modal">
+        <div class="modal-content">
+            <h3>Add Authorized User</h3>
+            <div class="form-group"><label>Username</label><input type="text" id="newUsername"></div>
+            <div class="form-group"><label>Email Address</label><input type="email" id="newEmail"></div>
+            <div class="form-group"><label>Password</label><input type="password" id="newPassword"></div>
+            <div class="form-group"><label>Role</label><select id="newRole"><option value="employee">Employee</option><option value="admin">Admin</option></select></div>
+            <div style="display: flex; gap: 10px; margin-top: 20px;">
+                <button class="btn btn-success" onclick="submitNewUser()">Save User</button>
+                <button class="btn logout-btn" onclick="closeUserModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="fileModal" class="modal">
+        <div class="modal-content">
+            <h3>Upload Protected File</h3>
+            <div class="form-group"><label>Select File</label><input type="file" id="fileInput"></div>
+            <div style="display: flex; gap: 10px; margin-top: 20px;">
+                <button class="btn btn-success" onclick="submitUploadFile()">Upload</button>
+                <button class="btn logout-btn" onclick="closeFileModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentUser = null;
+        let currentRole = null;
+
+        async function initDashboard() {
+            try {
+                const meRes = await fetch('/api/me');
+                if (!meRes.ok) { window.location.href = '/'; return; }
+                const meData = await meRes.json();
+                currentUser = meData.username;
+                currentRole = meData.role;
+
+                document.getElementById('userDisplay').innerText = currentUser;
+                document.getElementById('roleDisplay').innerText = currentRole;
+
+                if (currentRole === 'admin') {
+                    document.getElementById('usersTab').style.display = 'flex';
+                    document.getElementById('permsTab').style.display = 'flex';
+                    document.getElementById('auditTab').style.display = 'flex';
+                    document.getElementById('uploadFileBtn').style.display = 'block';
+                }
+
+                loadData();
+            } catch (err) {
+                console.error("Dashboard init error", err);
+            }
+        }
+
+        async function loadData() {
+            const res = await fetch('/api/data');
+            const data = await res.json();
+            if (!data.success) return;
+
+            // Render Files
+            const tbody = document.getElementById('filesTableBody');
+            tbody.innerHTML = '';
+            data.files.forEach(f => {
+                const tr = document.createElement('tr');
+                let deleteFileBtn = (currentRole === 'admin') ? `<button class="btn btn-danger" style="padding: 5px 10px; margin-left: 8px;" onclick="deleteFile('${f.filename}')">Delete</button>` : '';
+                tr.innerHTML = `
+                    <td>${f.filename}</td>
+                    <td>${f.file_size_kb} KB</td>
+                    <td style="font-family: monospace; font-size: 12px;">${f.sha256}</td>
+                    <td>
+                        <button class="btn" style="padding: 5px 10px;" onclick="downloadFile('${f.filename}')">Read / Download</button>
+                        ${deleteFileBtn}
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            if (currentRole === 'admin') {
+                // Render Users
+                if (data.users) {
+                    const uBody = document.getElementById('usersTableBody');
+                    uBody.innerHTML = '';
+                    data.users.forEach(u => {
+                        const tr = document.createElement('tr');
+                        let actionHtml = (u.username === 'Madhvan') ? '<span style="color: #64748b;">Protected Admin</span>' : `<button class="btn btn-danger" style="padding: 5px 10px;" onclick="deleteUser('${u.username}')">Remove</button>`;
+                        tr.innerHTML = `<td>${u.username}</td><td>${u.role}</td><td>${u.email || 'No Email'}</td><td>${u.permanently_locked ? 'Locked' : 'Active'}</td><td>${actionHtml}</td>`;
+                        uBody.appendChild(tr);
+                    });
+                }
+
+                // Render Permissions Matrix
+                if (data.permissions) {
+                    const pBody = document.getElementById('permsTableBody');
+                    pBody.innerHTML = '';
+                    data.permissions.forEach(p => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${p.username}</td>
+                            <td>${p.filename}</td>
+                            <td><input type="checkbox" id="perm_${p.username}_${p.filename}" ${p.can_read ? 'checked' : ''}></td>
+                            <td><button class="btn" style="padding: 5px 10px;" onclick="updatePermission('${p.username}', '${p.filename}')">Update Access</button></td>
+                        `;
+                        pBody.appendChild(tr);
+                    });
+                }
+
+                // Render Audit Logs
+                if (data.audit) {
+                    const aBody = document.getElementById('auditTableBody');
+                    aBody.innerHTML = '';
+                    data.audit.forEach(a => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `<td>${a.timestamp}</td><td>${a.username}</td><td>${a.action}</td><td>${a.status}</td><td>${a.filename}</td>`;
+                        aBody.appendChild(tr);
+                    });
+                }
+            }
+        }
+
+        async function updatePermission(username, filename) {
+            const checkbox = document.getElementById(`perm_${username}_${filename}`);
+            const can_read = checkbox.checked ? 1 : 0;
+
+            const res = await fetch('/api/permissions/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, filename, can_read })
+            });
+            const data = await res.json();
+            if (res.ok && data.ok) {
+                alert(`Access ${can_read ? 'granted to' : 'revoked from'} ${username} for ${filename}.`);
+                loadData();
+            } else {
+                alert(data.error || "Failed to update permission.");
+            }
+        }
+
+        function switchTab(tab) {
+            document.querySelectorAll('.sidebar-menu li').forEach(el => el.classList.remove('active'));
+            document.getElementById('section-files').style.display = 'none';
+            document.getElementById('section-users').style.display = 'none';
+            document.getElementById('section-perms').style.display = 'none';
+            document.getElementById('section-audit').style.display = 'none';
+
+            if (tab === 'files') document.getElementById('section-files').style.display = 'block';
+            else if (tab === 'users') document.getElementById('section-users').style.display = 'block';
+            else if (tab === 'perms') document.getElementById('section-perms').style.display = 'block';
+            else if (tab === 'audit') document.getElementById('section-audit').style.display = 'block';
+            event.currentTarget.classList.add('active');
+        }
+
+        function downloadFile(filename) { window.location.href = `/api/files/download/${encodeURIComponent(filename)}`; }
+        function openUserModal() { document.getElementById('userModal').style.display = 'flex'; }
+        function closeUserModal() { document.getElementById('userModal').style.display = 'none'; }
+        function openFileModal() { document.getElementById('fileModal').style.display = 'flex'; }
+        function closeFileModal() { document.getElementById('fileModal').style.display = 'none'; }
+
+        async function submitNewUser() {
+            const username = document.getElementById('newUsername').value.trim();
+            const email = document.getElementById('newEmail').value.trim();
+            const password = document.getElementById('newPassword').value;
+            const role = document.getElementById('newRole').value;
+            if (!username || !email || !password) { alert("Fill all fields."); return; }
+            const res = await fetch('/api/users/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, email, password, role }) });
+            const data = await res.json();
+            if (res.ok && data.ok) { alert(data.message); closeUserModal(); loadData(); } else { alert(data.error || "Failed."); }
+        }
+
+        async function deleteUser(username) {
+            if (!confirm(`Delete user '${username}'?`)) return;
+            const res = await fetch('/api/users/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }) });
+            const data = await res.json();
+            if (res.ok && data.ok) { alert(data.message); loadData(); } else { alert(data.error || "Failed."); }
+        }
+
+        async function submitUploadFile() {
+            const fileInput = document.getElementById('fileInput');
+            if (fileInput.files.length === 0) { alert("Select a file."); return; }
+            const formData = new FormData(); formData.append("file", fileInput.files[0]);
+            const res = await fetch('/api/files/upload', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (res.ok && data.ok) { alert(data.message); closeFileModal(); loadData(); } else { alert(data.error || "Failed."); }
+        }
+
+        async function deleteFile(filename) {
+            if (!confirm(`Delete file '${filename}'?`)) return;
+            const res = await fetch('/api/files/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename }) });
+            const data = await res.json();
+            if (res.ok && data.ok) { alert(data.message); loadData(); } else { alert(data.error || "Failed."); }
+        }
+
+        async function logout() { await fetch('/api/logout', { method: 'POST' }); window.location.href = '/'; }
+
+        initDashboard();
+    </script>
+</body>
+</html>

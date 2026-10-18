@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aegis - Enterprise File Security Login</title>
+    <style>
+        :root {
+            --bg-main: #0f172a;
+            --bg-card: #1e293b;
+            --border-color: #334155;
+            --accent: #38bdf8;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+        }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg-main); color: var(--text-main); display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .login-card { background: var(--bg-card); padding: 40px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); width: 400px; border: 1px solid var(--border-color); box-sizing: border-box; }
+        h2 { text-align: center; color: var(--accent); margin-top: 0; margin-bottom: 24px; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; margin-bottom: 8px; font-size: 14px; color: var(--text-muted); }
+        input { width: 100%; padding: 12px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-main); color: #fff; font-size: 16px; box-sizing: border-box; }
+        input:focus { outline: none; border-color: var(--accent); }
+        button { width: 100%; padding: 12px; background: #0284c7; border: none; border-radius: 6px; color: #fff; font-size: 16px; font-weight: bold; cursor: pointer; transition: background 0.2s; }
+        button:hover { background: #0ea5e9; }
+        button:disabled { background: #475569; cursor: not-allowed; }
+        .error-msg { background: #7f1d1d; color: #fca5a5; padding: 10px; border-radius: 6px; margin-bottom: 15px; font-size: 14px; display: none; text-align: center; }
+        .success-msg { background: #14532d; color: #86efac; padding: 10px; border-radius: 6px; margin-bottom: 15px; font-size: 14px; display: none; text-align: center; }
+        .links { margin-top: 20px; text-align: center; font-size: 14px; }
+        .links a { color: var(--accent); text-decoration: none; cursor: pointer; }
+        .links a:hover { text-decoration: underline; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <!-- SCREEN 1: Login View -->
+        <div id="loginSection">
+            <h2>Aegis Security Portal</h2>
+            <div id="errorBox" class="error-msg"></div>
+            
+            <form id="loginForm">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" required autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" required autocomplete="current-password">
+                </div>
+                <button type="submit" id="submitBtn">Sign In</button>
+            </form>
+
+            <div class="links">
+                <a onclick="switchView('resetRequest')">Forgot Password?</a>
+            </div>
+        </div>
+
+        <!-- SCREEN 2: Request Password Reset (Username + Email) -->
+        <div id="resetRequestSection" class="hidden">
+            <h2>Forgot Password</h2>
+            <div id="resetReqError" class="error-msg"></div>
+            <div id="resetReqSuccess" class="success-msg"></div>
+            
+            <form id="resetReqForm">
+                <div class="form-group">
+                    <label for="resetUsername">Username</label>
+                    <input type="text" id="resetUsername" required>
+                </div>
+                <div class="form-group">
+                    <label for="resetEmail">Registered Email</label>
+                    <input type="email" id="resetEmail" required>
+                </div>
+                <button type="submit" id="reqOtpBtn">Send Reset OTP</button>
+            </form>
+
+            <div class="links">
+                <a onclick="switchView('login')">Back to Sign In</a>
+            </div>
+        </div>
+
+        <!-- SCREEN 3: Verify OTP Code (OTP Entry Screen) -->
+        <div id="verifyOtpSection" class="hidden">
+            <h2>Verify OTP Code</h2>
+            <div id="otpError" class="error-msg"></div>
+            <div id="otpSuccess" class="success-msg"></div>
+            
+            <form id="verifyOtpForm">
+                <div class="form-group">
+                    <label for="otpCode">6-Digit OTP Code</label>
+                    <input type="text" id="otpCode" maxlength="6" required placeholder="Enter OTP code">
+                </div>
+                <button type="submit" id="verifyOtpBtn">Verify OTP</button>
+            </form>
+
+            <div class="links">
+                <a onclick="switchView('login')">Cancel & Return to Login</a>
+            </div>
+        </div>
+
+        <!-- SCREEN 4: Enter New Password & Confirm Password -->
+        <div id="resetCompleteSection" class="hidden">
+            <h2>Set New Password</h2>
+            <div id="resetCompError" class="error-msg"></div>
+            <div id="resetCompSuccess" class="success-msg"></div>
+            
+            <form id="resetCompForm">
+                <div class="form-group">
+                    <label for="newPassword">New Password</label>
+                    <input type="password" id="newPassword" required placeholder="Min 8 characters">
+                </div>
+                <div class="form-group">
+                    <label for="confirmPassword">Confirm New Password</label>
+                    <input type="password" id="confirmPassword" required placeholder="Re-enter new password">
+                </div>
+                <button type="submit" id="completeBtn">Update Password</button>
+            </form>
+
+            <div class="links">
+                <a onclick="switchView('login')">Cancel & Return to Login</a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let resetUsername = '';
+        let verifiedOtpCode = '';
+
+        function switchView(viewName) {
+            document.getElementById('loginSection').classList.add('hidden');
+            document.getElementById('resetRequestSection').classList.add('hidden');
+            document.getElementById('verifyOtpSection').classList.add('hidden');
+            document.getElementById('resetCompleteSection').classList.add('hidden');
+
+            document.getElementById('errorBox').style.display = 'none';
+            document.getElementById('resetReqError').style.display = 'none';
+            document.getElementById('resetReqSuccess').style.display = 'none';
+            document.getElementById('otpError').style.display = 'none';
+            document.getElementById('otpSuccess').style.display = 'none';
+            document.getElementById('resetCompError').style.display = 'none';
+            document.getElementById('resetCompSuccess').style.display = 'none';
+
+            if (viewName === 'login') {
+                document.getElementById('loginSection').classList.remove('hidden');
+            } else if (viewName === 'resetRequest') {
+                document.getElementById('resetRequestSection').classList.remove('hidden');
+            } else if (viewName === 'verifyOtp') {
+                document.getElementById('verifyOtpSection').classList.remove('hidden');
+            } else if (viewName === 'resetComplete') {
+                document.getElementById('resetCompleteSection').classList.remove('hidden');
+            }
+        }
+
+        // Screen 1: Login Handler (1-sec Timer)
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const submitBtn = document.getElementById('submitBtn');
+            const errorBox = document.getElementById('errorBox');
+            submitBtn.disabled = true;
+            errorBox.style.display = 'none';
+
+            let timer = 1;
+            submitBtn.innerText = `Authenticating (${timer}s)...`;
+            const interval = setInterval(() => {
+                timer--;
+                if (timer > 0) submitBtn.innerText = `Authenticating (${timer}s)...`;
+            }, 1000);
+
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value;
+
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                const data = await res.json();
+
+                setTimeout(() => {
+                    clearInterval(interval);
+                    if (res.ok && data.ok) {
+                        window.location.href = '/dashboard';
+                    } else {
+                        errorBox.innerText = data.error || 'Login failed.';
+                        errorBox.style.display = 'block';
+                        submitBtn.disabled = false;
+                        submitBtn.innerText = 'Sign In';
+                    }
+                }, 1000);
+            } catch (err) {
+                clearInterval(interval);
+                errorBox.innerText = 'Server error.';
+                errorBox.style.display = 'block';
+                submitBtn.disabled = false;
+                submitBtn.innerText = 'Sign In';
+            }
+        });
+
+        // Screen 2: Request OTP Handler
+        document.getElementById('resetReqForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('resetUsername').value.trim();
+            const email = document.getElementById('resetEmail').value.trim();
+            const reqError = document.getElementById('resetReqError');
+            const reqSuccess = document.getElementById('resetReqSuccess');
+
+            reqError.style.display = 'none';
+            reqSuccess.style.display = 'none';
+
+            try {
+                const res = await fetch('/api/password-reset/request', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, email })
+                });
+                const data = await res.json();
+                if (res.ok && data.ok) {
+                    resetUsername = username;
+                    reqSuccess.innerText = data.message;
+                    reqSuccess.style.display = 'block';
+                    setTimeout(() => switchView('verifyOtp'), 1200);
+                } else {
+                    reqError.innerText = data.error || 'Failed to request OTP.';
+                    reqError.style.display = 'block';
+                }
+            } catch (err) {
+                reqError.innerText = 'Server connection error.';
+                reqError.style.display = 'block';
+            }
+        });
+
+        // Screen 3: Verify OTP Handler
+        document.getElementById('verifyOtpForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const code = document.getElementById('otpCode').value.trim();
+            const otpError = document.getElementById('otpError');
+            const otpSuccess = document.getElementById('otpSuccess');
+
+            otpError.style.display = 'none';
+            otpSuccess.style.display = 'none';
+
+            try {
+                const res = await fetch('/api/password-reset/verify-otp', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: resetUsername, code })
+                });
+                const data = await res.json();
+                if (res.ok && data.ok) {
+                    verifiedOtpCode = code;
+                    otpSuccess.innerText = data.message;
+                    otpSuccess.style.display = 'block';
+                    setTimeout(() => switchView('resetComplete'), 1000);
+                } else {
+                    otpError.innerText = data.error || 'Invalid OTP code.';
+                    otpError.style.display = 'block';
+                }
+            } catch (err) {
+                otpError.innerText = 'Server connection error.';
+                otpError.style.display = 'block';
+            }
+        });
+
+        // Screen 4: Update Password Handler
+        document.getElementById('resetCompForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const new_password = document.getElementById('newPassword').value;
+            const confirm_password = document.getElementById('confirmPassword').value;
+            const compError = document.getElementById('resetCompError');
+            const compSuccess = document.getElementById('resetCompSuccess');
+
+            compError.style.display = 'none';
+            compSuccess.style.display = 'none';
+
+            if (new_password !== confirm_password) {
+                compError.innerText = "New Password and Confirm Password do not match.";
+                compError.style.display = 'block';
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/password-reset/complete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        username: resetUsername, 
+                        code: verifiedOtpCode, 
+                        new_password, 
+                        confirm_password 
+                    })
+                });
+                const data = await res.json();
+                if (res.ok && data.ok) {
+                    compSuccess.innerText = data.message;
+                    compSuccess.style.display = 'block';
+                    setTimeout(() => switchView('login'), 2000);
+                } else {
+                    compError.innerText = data.error || 'Failed to update password.';
+                    compError.style.display = 'block';
+                }
+            } catch (err) {
+                compError.innerText = 'Server connection error.';
+                compError.style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
