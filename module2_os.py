@@ -151,3 +151,27 @@ def simulate_process_scheduling(task_list):
         # Process completed simulated quantum
 
     return f"Round-Robin Scheduling: Executed {len(execution_order)} Threads with Quantum={quantum_ms}ms"
+
+def secure_os_read_stream(filepath):
+    """
+    Securely reads a file in chunks while checking its existence
+    and OS-level read permissions.
+    """
+    if not os.path.isfile(filepath):
+        return None, f"File not found: {filepath}"
+
+    if not os.access(filepath, os.R_OK):
+        return None, "OS Security Violation: Read permission denied."
+
+    try:
+        with open(filepath, "rb") as file:
+            while True:
+                chunk = file.read(4096)
+
+                if not chunk:
+                    break
+
+                yield chunk
+
+    except OSError as e:
+        yield f"OS Read Error: {e}".encode("utf-8")
