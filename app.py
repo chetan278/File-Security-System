@@ -17,7 +17,12 @@ from crypto_vault import (
 import bcrypt
 
 app = Flask(__name__, template_folder='static', static_folder='static')
-app.secret_key = 'aegis_secure_portal_secret_key'
+app.secret_key = os.environ["SECRET_KEY"]
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
 
 DATABASE = 'security_system.db'
 ENC_PREFIX = "ENC256:"
@@ -744,6 +749,7 @@ def api_security_scan():
     })
 
 
+init_db()
+
 if __name__ == '__main__':
-    init_db()
-    app.run(debug=True, port=5000)
+    app.run(debug=False, port=5000)
