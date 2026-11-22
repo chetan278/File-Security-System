@@ -2,7 +2,12 @@ import os
 import sqlite3
 import csv
 import io
-from datetime import datetime
+import secrets
+import hashlib
+import hmac
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, session, jsonify
 from module3_security import (
     authenticate_login, get_soc_metrics, set_emergency_lockdown,
@@ -16,16 +21,62 @@ from crypto_vault import (
 )
 import bcrypt
 
+def load_local_env():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(env_path, "r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                name, value = name.strip(), value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                if name:
+                    os.environ.setdefault(name, value)
+    except FileNotFoundError:
+        pass
+
+load_local_env()
+
 app = Flask(__name__, template_folder='static', static_folder='static')
-app.secret_key = os.environ["SECRET_KEY"]
-app.config.update(
-    SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-)
+app.secret_key = 'aegis_secure_portal_secret_key'
 
 DATABASE = 'security_system.db'
 ENC_PREFIX = "ENC256:"
+RESET_CODE_LIFETIME_SECONDS = 600
+RESET_CODE_COOLDOWN_SECONDS = 60
+RESET_CODE_MAX_ATTEMPTS = 5
+
+
+def reset_code_digest(user_id, code):
+    secret = os.environ.get("AEGIS_OTP_PEPPER") or app.secret_key
+    payload = f"password-reset:{user_id}:{code}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def send_reset_email(email_address, code):
+    sender = os.environ.get("GMAIL_ADDRESS", "").strip()
+    app_password = "".join(os.environ.get("GMAIL_APP_PASSWORD", "").split())
+    if not sender or not app_password:
+        return False
+    message = EmailMessage()
+    message["Subject"] = "Aegis password reset code"
+    message["From"] = sender
+    message["To"] = email_address
+    message.set_content(f"Your password reset code is {code}. It expires in 10 minutes. Do not share it.")
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+            smtp.login(sender, app_password)
+            smtp.send_message(message)
+        return True
+    except (smtplib.SMTPException, TimeoutError, OSError):
+        app.logger.exception("Gmail SMTP could not send a password reset code")
+        return False
 
 
 def encrypt_for_storage(plain_text: str) -> str:
@@ -141,6 +192,18 @@ def init_db():
         )
     ''')
 
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS password_reset_otps (
+            user_id INTEGER PRIMARY KEY,
+            code_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            verified_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+    ''')
+
     conn.commit()
 
     hashed_admin_pw = bcrypt.hashpw('Admin123'.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -238,6 +301,134 @@ def api_login():
         if auth_res.get("edge_blocked"):
             return jsonify({'error': auth_res.get('message'), 'edge_blocked': True}), 403
         return jsonify({'error': auth_res.get('message', 'Login failed!')}), 401
+
+
+@app.route('/api/forgot/send-otp', methods=['POST'])
+def api_forgot_send_otp():
+    data = parse_request_data()
+    username = str(data.get('username', '')).strip()
+    email = str(data.get('email', '')).strip().lower()
+    if not username or not email:
+        return jsonify({'error': 'Enter your username and registered email.'}), 400
+    sender = os.environ.get('GMAIL_ADDRESS', '').strip()
+    if not sender or not os.environ.get('GMAIL_APP_PASSWORD', '').strip():
+        return jsonify({'error': 'Gmail SMTP is not configured. Set GMAIL_ADDRESS and GMAIL_APP_PASSWORD in the project .env file.'}), 503
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, email FROM users WHERE LOWER(username)=LOWER(?)', (username,))
+        user = cursor.fetchone()
+        if not user or user['email'].strip().lower() != email:
+            return jsonify({'error': 'Username and registered email do not match.'}), 400
+        user_id, email_address = user['id'], user['email']
+        now = datetime.now(timezone.utc)
+        cursor.execute('SELECT created_at FROM password_reset_otps WHERE user_id=?', (user_id,))
+        previous = cursor.fetchone()
+        if previous:
+            created_at = datetime.fromisoformat(previous['created_at'])
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if (now - created_at).total_seconds() < RESET_CODE_COOLDOWN_SECONDS:
+                return jsonify({'error': 'Wait one minute before requesting another code.'}), 429
+        code = f'{secrets.randbelow(1_000_000):06d}'
+        cursor.execute('''INSERT OR REPLACE INTO password_reset_otps
+                          (user_id, code_hash, created_at, expires_at, attempts, verified_at)
+                          VALUES (?, ?, ?, ?, 0, NULL)''',
+                       (user_id, reset_code_digest(user_id, code), now.isoformat(),
+                        (now + timedelta(seconds=RESET_CODE_LIFETIME_SECONDS)).isoformat()))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        app.logger.exception('Could not create a password reset code')
+        return jsonify({'error': 'The reset code could not be created.'}), 500
+    finally:
+        conn.close()
+
+    if not send_reset_email(email_address, code):
+        conn = get_db_connection()
+        try:
+            conn.execute('DELETE FROM password_reset_otps WHERE user_id=?', (user_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        return jsonify({'error': 'Gmail could not send the reset code. Check the Gmail settings and server terminal.'}), 503
+    return jsonify({'ok': True, 'message': 'A reset code was sent to your registered email. It expires in 10 minutes.'})
+
+
+@app.route('/api/forgot/verify-otp', methods=['POST'])
+def api_forgot_verify_otp():
+    data = parse_request_data()
+    username = str(data.get('username', '')).strip()
+    code = str(data.get('otp', '')).strip()
+    if not username or len(code) != 6 or not code.isdigit():
+        return jsonify({'error': 'Enter the six-digit code.'}), 400
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''SELECT u.id, r.code_hash, r.expires_at, r.attempts
+                          FROM users u JOIN password_reset_otps r ON r.user_id=u.id
+                          WHERE LOWER(u.username)=LOWER(?)''', (username,))
+        reset = cursor.fetchone()
+        if not reset:
+            return jsonify({'error': 'The code is invalid or expired. Request a new one.'}), 400
+        user_id, stored_hash, expires_at, attempts = reset
+        expires = datetime.fromisoformat(expires_at)
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if not stored_hash or expires <= now or attempts >= RESET_CODE_MAX_ATTEMPTS:
+            return jsonify({'error': 'The code is invalid or expired. Request a new one.'}), 400
+        if not hmac.compare_digest(stored_hash, reset_code_digest(user_id, code)):
+            cursor.execute('UPDATE password_reset_otps SET attempts=attempts+1 WHERE user_id=?', (user_id,))
+            conn.commit()
+            return jsonify({'error': 'The code is incorrect.'}), 400
+        cursor.execute('UPDATE password_reset_otps SET verified_at=? WHERE user_id=?', (now.isoformat(), user_id))
+        conn.commit()
+        return jsonify({'ok': True})
+    except Exception:
+        conn.rollback()
+        app.logger.exception('Could not verify a password reset code')
+        return jsonify({'error': 'The code could not be verified.'}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/forgot/reset', methods=['POST'])
+def api_forgot_reset():
+    data = parse_request_data()
+    username = str(data.get('username', '')).strip()
+    new_password = data.get('new_password', '')
+    if not username or not isinstance(new_password, str) or len(new_password) < 8:
+        return jsonify({'error': 'The new password must be at least 8 characters.'}), 400
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''SELECT u.id, r.expires_at, r.verified_at
+                          FROM users u JOIN password_reset_otps r ON r.user_id=u.id
+                          WHERE LOWER(u.username)=LOWER(?)''', (username,))
+        reset = cursor.fetchone()
+        if not reset or not reset['verified_at']:
+            return jsonify({'error': 'Verify the email code before changing the password.'}), 400
+        expires = datetime.fromisoformat(reset['expires_at'])
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires <= datetime.now(timezone.utc):
+            cursor.execute('DELETE FROM password_reset_otps WHERE user_id=?', (reset['id'],))
+            conn.commit()
+            return jsonify({'error': 'The code expired. Request a new one.'}), 400
+        password_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        cursor.execute('UPDATE users SET password_hash=?, is_locked=0, failed_attempts=0 WHERE id=?',
+                       (password_hash, reset['id']))
+        cursor.execute('DELETE FROM password_reset_otps WHERE user_id=?', (reset['id'],))
+        conn.commit()
+        return jsonify({'ok': True, 'message': 'Password updated. Please sign in again.'})
+    except Exception:
+        conn.rollback()
+        app.logger.exception('Could not update a password through email recovery')
+        return jsonify({'error': 'The password could not be updated.'}), 500
+    finally:
+        conn.close()
 
 
 @app.route('/api/logout', methods=['POST'])
@@ -749,7 +940,6 @@ def api_security_scan():
     })
 
 
-init_db()
-
 if __name__ == '__main__':
-    app.run(debug=False, port=5000)
+    init_db()
+    app.run(debug=True, port=5000)
