@@ -142,3 +142,9 @@ This project demonstrates how DBMS, operating-system concepts, and application s
 ## Repository
 
 Source code: https://github.com/chetan278/File-Security-System
+
+## Live Demo
+
+Project Link: https://file-security-system-1.onrender.com
+
+The project is successfully deployed on Render and is accessible online.
