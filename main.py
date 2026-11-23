@@ -111,4 +111,5 @@ def run_project_demo():
     dbms_crash_recovery_demo()
 
 if __name__ == "__main__":
+
     run_project_demo()
