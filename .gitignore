@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+.aegis_file_key
+.venv/
+__pycache__/
+*.py[cod]
+*-shm
+*-wal
+database_backups/
