@@ -1,358 +1,134 @@
 import bcrypt
 import hashlib
 import os
-import shutil
-import sqlite3
-import json
-import time
+import ipaddress
 from datetime import datetime, timedelta, timezone
-from module1_dbms import get_db_connection
+from math import ceil
+from module1_dbms import get_db_connection, insert_audit_record
 
 MAX_FAILED_ATTEMPTS = 3
-BACKUP_DIR = "security_media_backups"
+TEMPORARY_LOCK_SECONDS = 30
+PERMANENT_AFTER_LOCKOUTS = 3
 
-if not os.path.exists(BACKUP_DIR):
-    os.makedirs(BACKUP_DIR)
+def normalize_ip_address(address):
+    return str(ipaddress.ip_address(str(address).strip()))
 
-# =========================================================================
-# 1. REAL-TIME NETWORK IP FIREWALL & AUTO-BLOCK MANAGER
-# =========================================================================
-IP_BLOCKLIST_DB = {
-    "185.220.101.5": {"reason": "Suspicious Activity", "blocked_at": "2026-11-08 12:00", "country": "DE"},
-    "45.144.225.12": {"reason": "Multiple Failed Logins", "blocked_at": "2026-11-08 12:30", "country": "RU"}
-}
+def normalize_network_range(cidr):
+    return str(ipaddress.ip_network(str(cidr).strip(), strict=False))
 
-def verify_ip_reputation(ip_address):
-    """Real-time Check: Checks if Client IP is blocked in Firewall"""
-    if not ip_address:
-        ip_address = "127.0.0.1"
-
-    if ip_address in IP_BLOCKLIST_DB:
-        block_info = IP_BLOCKLIST_DB[ip_address]
-        return {
-            "ok": False,
-            "status": "BLOCKED",
-            "reason": block_info["reason"],
-            "message": f"🚫 ACCESS DENIED: IP Address {ip_address} is blocked by Admin ({block_info['reason']})."
-        }
-    return {"ok": True, "message": "IP Check Passed."}
-
-def add_ip_to_blocklist(ip_address, reason="Manual Admin Block", country="Local Network"):
-    """Adds a new client/server IP to the firewall blocklist in real time."""
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    block_info = {
-        "reason": reason,
-        "blocked_at": now_str,
-        "country": country
-    }
-    IP_BLOCKLIST_DB[ip_address] = block_info
-    return block_info
-
-def remove_ip_from_blocklist(ip_address):
-    """Unblocks an IP from the firewall."""
-    if ip_address in IP_BLOCKLIST_DB:
-        del IP_BLOCKLIST_DB[ip_address]
+def geofence_denies(address, rules):
+    try:
+        client = ipaddress.ip_address(address)
+        networks = [ipaddress.ip_network(row[0], strict=False) for row in rules]
+    except ValueError:
         return True
-    return False
+    return bool(networks) and not any(client.version == network.version and client in network for network in networks)
 
-def get_ip_blocklist_summary():
-    """Returns list of all currently blocked IPs."""
-    return {
-        "ok": True,
-        "total_blocked": len(IP_BLOCKLIST_DB),
-        "blocked_ips": IP_BLOCKLIST_DB
-    }
+def is_ip_blocked(cur, address):
+    return cur.execute("SELECT 1 FROM firewall_rules WHERE ip_address=?", (address,)).fetchone() is not None
 
-# =========================================================================
-# 2. BLOCKCHAIN-BACKED IMMUTABLE AUDIT TRAIL
-# =========================================================================
-def calculate_blockchain_hash(previous_hash, username, action, status, filename, timestamp):
-    data_block = f"{previous_hash}|{username}|{action}|{status}|{filename}|{timestamp}"
-    return hashlib.sha256(data_block.encode('utf-8')).hexdigest()
+def is_emergency_lockdown_enabled(cur):
+    row = cur.execute("SELECT value FROM system_config WHERE key='emergency_lockdown'").fetchone()
+    return bool(row and row[0] == "1")
 
-def log_audit_blockchain(username, action, status, filename="PORTAL"):
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(audit_logs);")
-        columns = [column[1] for column in cur.fetchall()]
-        if 'block_hash' not in columns:
-            cur.execute("ALTER TABLE audit_logs ADD COLUMN block_hash TEXT;")
-            cur.execute("ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT;")
-            conn.commit()
+def add_ip_block_rule(cur, address, reason, blocked_at, blocked_by):
+    cur.execute("""INSERT INTO firewall_rules(ip_address,reason,blocked_at,blocked_by)
+                   VALUES(?,?,?,?) ON CONFLICT(ip_address) DO UPDATE SET reason=excluded.reason,
+                   blocked_at=excluded.blocked_at,blocked_by=excluded.blocked_by""",
+                (address, reason, blocked_at, blocked_by))
 
-        cur.execute("SELECT block_hash FROM audit_logs ORDER BY id DESC LIMIT 1;")
-        last_block = cur.fetchone()
-        prev_hash = last_block[0] if (last_block and last_block[0]) else "0" * 64
+def remove_ip_block_rule(cur, address):
+    cur.execute("DELETE FROM firewall_rules WHERE ip_address=?", (address,))
+    return cur.rowcount > 0
 
-        timestamp = datetime.now(timezone.utc).isoformat()
-        curr_hash = calculate_blockchain_hash(prev_hash, username, action, status, filename, timestamp)
+def save_emergency_lockdown(cur, enabled):
+    cur.execute("""INSERT INTO system_config(key,value) VALUES('emergency_lockdown',?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""", ("1" if enabled else "0",))
 
-        cur.execute("""
-            INSERT INTO audit_logs (username, action, status, filename, timestamp, block_hash, prev_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (username, action, status, filename, timestamp, curr_hash, prev_hash))
+def add_allowed_network(cur, cidr, added_at, added_by):
+    cur.execute("INSERT OR IGNORE INTO geofence_rules(cidr,added_at,added_by) VALUES(?,?,?)",
+                (cidr, added_at, added_by))
 
-        conn.commit()
-        conn.close()
-        return curr_hash
-    except Exception as e:
-        print(f"Blockchain Audit Error: {e}")
+def remove_allowed_network(cur, cidr):
+    cur.execute("DELETE FROM geofence_rules WHERE cidr=?", (cidr,))
+    return cur.rowcount > 0
 
-def verify_blockchain_integrity():
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id, username, action, status, filename, timestamp, block_hash, prev_hash FROM audit_logs ORDER BY id ASC;")
-        logs = cur.fetchall()
-        conn.close()
-
-        expected_prev_hash = "0" * 64
-        for log in logs:
-            log_id, username, action, status, filename, timestamp, block_hash, prev_hash = log
-            if not block_hash:
-                continue 
-            recalculated_hash = calculate_blockchain_hash(prev_hash, username, action, status, filename, timestamp)
-            if recalculated_hash != block_hash or prev_hash != expected_prev_hash:
-                return {
-                    "ok": False,
-                    "status": "BLOCKCHAIN_TAMPER_DETECTED",
-                    "tampered_log_id": log_id,
-                    "message": f"ALERT: Blockchain Integrity Violation detected at Log Entry ID {log_id}!"
-                }
-            expected_prev_hash = block_hash
-
-        return {"ok": True, "status": "VERIFIED", "message": "Blockchain Audit Chain Intact. Zero Tampering Detected."}
-    except Exception as e:
-        return {"ok": False, "message": f"Verification Error: {str(e)}"}
-
-# =========================================================================
-# 3. KEYSTROKE DYNAMICS & BOT DETECTION
-# =========================================================================
-def verify_keystroke_dynamics(user_id, timing_array):
-    if not timing_array or len(timing_array) < 2:
-        return {"ok": True, "score": 100, "message": "Keystroke analysis skipped."}
-
-    avg_latency = sum(timing_array) / len(timing_array)
-    if avg_latency < 30:
-        return {"ok": False, "score": 10, "message": "SECURITY ALERT: Automated Bot or Scripted Injection Detected!"}
-    if avg_latency > 800:
-        return {"ok": False, "score": 40, "message": "KEYSTROKE DYNAMICS MISMATCH: Imposter typing rhythm detected!"}
-
-    return {"ok": True, "score": 95, "message": f"Keystroke Dynamics Matched ({int(avg_latency)}ms)."}
-
-# =========================================================================
-# 4. ZERO-TRUST GEO-IP & GEOFENCING
-# =========================================================================
-def verify_geo_ip_geofencing(ip_address):
-    if not ip_address:
-        ip_address = "127.0.0.1"
-    suspicious_subnets = ["192.168.100.", "10.99.99."]
-    if any(ip_address.startswith(sub) for sub in suspicious_subnets):
-        return {"ok": False, "message": f"ZERO-TRUST GUARD: Suspicious IP subnet ({ip_address}) blocked by Geofencing policy."}
-    return {"ok": True, "message": "IP Geofencing check passed."}
-
-# =========================================================================
-# 5. SOC & EMERGENCY LOCKDOWN CONTROLS
-# =========================================================================
-def set_emergency_lockdown(enable=True):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS system_config (key TEXT PRIMARY KEY, value TEXT)")
-    cur.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('lockdown_active', ?)", ('1' if enable else '0',))
-    conn.commit()
-    conn.close()
-    log_audit_blockchain("SYSTEM_ADMIN", "EMERGENCY_LOCKDOWN", "ENABLED_READ_ONLY" if enable else "DISABLED_NORMAL", "PORTAL_SECURITY")
-    return enable
-
-def get_emergency_lockdown_status():
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='system_config';")
-        if not cur.fetchone():
-            conn.close()
+def verify_audit_chain(cur):
+    previous = "0" * 64
+    for row in cur.execute("SELECT timestamp,username,action,status,filename,block_hash,prev_hash FROM audit_logs ORDER BY id"):
+        timestamp, username, action, status, filename, block_hash, prev_hash = row
+        payload = f"{previous}|{username}|{action}|{status}|{filename}|{timestamp}"
+        expected = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if prev_hash != previous or block_hash != expected:
             return False
-        cur.execute("SELECT value FROM system_config WHERE key = 'lockdown_active'")
-        row = cur.fetchone()
-        conn.close()
-        return row and row[0] == '1'
-    except:
-        return False
+        previous = block_hash
+    return True
+
+def record_canary_trip(cur, username, filename, address, timestamp):
+    insert_audit_record(cur, username, "CANARY_ACCESS_ATTEMPT", "TRIPPED", filename)
+    try:
+        parsed = ipaddress.ip_address(address)
+        if not parsed.is_loopback:
+            add_ip_block_rule(cur, address, "Security decoy file accessed", timestamp, "canary detector")
+            cur.execute("DELETE FROM active_sessions WHERE ip_address=?", (address,))
+    except ValueError:
+        pass
 
 def get_soc_metrics():
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT count(*) FROM audit_logs WHERE action LIKE '%LOGIN%' AND (status LIKE '%LOCKED%' OR status LIKE '%FAILED%')")
-        brute_force_blocks = cur.fetchone()[0]
-        
-        cur.execute("SELECT count(*) FROM audit_logs WHERE action LIKE '%KEYSTROKE%' OR status LIKE '%IMPOSTER%' OR status LIKE '%BOT%'")
-        bot_detections = cur.fetchone()[0]
-
-        cur.execute("SELECT count(*) FROM audit_logs WHERE action LIKE '%FIREWALL%' OR action LIKE '%BLOCK%'")
-        firewall_blocks = cur.fetchone()[0]
-        conn.close()
-        
-        is_locked = get_emergency_lockdown_status()
-        if is_locked:
-            threat_level = "RED (EMERGENCY LOCKDOWN)"
-        elif brute_force_blocks > 2 or bot_detections > 0 or firewall_blocks > 0:
-            threat_level = "ORANGE (ELEVATED THREAT)"
-        else:
-            threat_level = "GREEN (NORMAL ZERO-TRUST)"
-            
-        return {
-            "ok": True,
-            "brute_force_blocks": brute_force_blocks,
-            "bot_detections": bot_detections,
-            "firewall_blocks": firewall_blocks,
-            "threat_level": threat_level,
-            "lockdown_active": is_locked,
-            "active_blocked_ips": len(IP_BLOCKLIST_DB)
-        }
-    except Exception as e:
-        return {
-            "ok": True,
-            "brute_force_blocks": 0,
-            "bot_detections": 0,
-            "firewall_blocks": 0,
-            "threat_level": "GREEN (NORMAL ZERO-TRUST)",
-            "lockdown_active": False,
-            "active_blocked_ips": len(IP_BLOCKLIST_DB)
-        }
-
-# =========================================================================
-# 6. AUTHENTICATION ENGINE
-# =========================================================================
-def authenticate_login(username, password, keystroke_timings=None, client_ip="127.0.0.1"):
-    try:
-        ip_check = verify_ip_reputation(client_ip)
-        if not ip_check["ok"]:
-            log_audit_blockchain(username, 'FIREWALL_IP_BLOCK', 'BLOCKED', client_ip)
-            return {"ok": False, "edge_blocked": True, "message": ip_check["message"]}
-
-        geo_res = verify_geo_ip_geofencing(client_ip)
-        if not geo_res["ok"]:
-            log_audit_blockchain(username, 'GEOFENCE_BLOCK', 'BLOCKED_IP', client_ip)
-            return {"ok": False, "message": geo_res["message"]}
-
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, username, password_hash, role, failed_attempts, is_locked, locked_until 
-            FROM users WHERE LOWER(username) = LOWER(?)
-        """, (username,))
-        user = cur.fetchone()
-        
-        if not user:
-            conn.close()
-            log_audit_blockchain(username, 'LOGIN', 'FAILED_USER_NOT_FOUND', 'PORTAL')
-            return {"ok": False, "message": "Unauthorized username or invalid credentials."}
-
-        user_id, db_username, stored_hash, role, failed_attempts, is_locked, locked_until = user
-
-        if keystroke_timings:
-            ks_res = verify_keystroke_dynamics(user_id, keystroke_timings)
-            if not ks_res["ok"]:
-                conn.close()
-                log_audit_blockchain(db_username, 'KEYSTROKE_DYNAMIC_REJECT', 'BOT_DETECTED', 'PORTAL')
-                return {"ok": False, "message": ks_res["message"]}
-
-        if locked_until:
-            try:
-                lock_time = datetime.fromisoformat(locked_until)
-                if lock_time.tzinfo is None:
-                    lock_time = lock_time.replace(tzinfo=timezone.utc)
-                if datetime.now(timezone.utc) < lock_time:
-                    remaining = int((lock_time - datetime.now(timezone.utc)).total_seconds()) + 1
-                    conn.close()
-                    return {"ok": False, "locked": True, "message": f"Cooldown active. Wait {remaining} seconds."}
-            except:
-                pass
-
-        if is_locked == 1:
-            conn.close()
-            return {"ok": False, "locked": True, "message": "Account permanently locked. Contact admin."}
-
-        password_valid = False
-        try:
-            password_valid = bcrypt.checkpw(password.encode('utf-8'), stored_hash.encode('utf-8'))
-        except:
-            password_valid = (password == stored_hash)
-
-        if password_valid:
-            cur.execute("UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?", (user_id,))
-            conn.commit()
-            conn.close()
-            log_audit_blockchain(db_username, 'LOGIN', 'SUCCESS', 'PORTAL')
-            return {"ok": True, "id": user_id, "username": db_username, "role": role}
-        else:
-            new_attempts = failed_attempts + 1
-            is_locked_val = 1 if new_attempts >= MAX_FAILED_ATTEMPTS else 0
-            cooldown_until = (datetime.now(timezone.utc) + timedelta(seconds=15)).isoformat()
-            
-            cur.execute("UPDATE users SET failed_attempts = ?, is_locked = ?, locked_until = ? WHERE id = ?", 
-                        (new_attempts, is_locked_val, cooldown_until, user_id))
-            conn.commit()
-            conn.close()
-
-            # Auto-block IP if failed attempts reach threshold
-            if new_attempts >= MAX_FAILED_ATTEMPTS:
-                add_ip_to_blocklist(client_ip, reason="Automated Brute-Force Attack Detected")
-
-            if is_locked_val:
-                log_audit_blockchain(db_username, 'FAILED_LOGIN', 'ACCOUNT_LOCKED_3_ATTEMPTS', 'PORTAL')
-                return {"ok": False, "locked": True, "message": "Account locked after 3 failed attempts."}
-            else:
-                log_audit_blockchain(db_username, 'FAILED_LOGIN', f'ATTEMPT_{new_attempts}_OF_3', 'PORTAL')
-                return {"ok": False, "locked": False, "message": f"Invalid password. Attempt {new_attempts}/3."}
-    except Exception as e:
-        return {"ok": False, "message": f"Login error: {str(e)}"}
-
-def execute_2pl_secure_transaction(username, filename, action_type):
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        cur.execute("BEGIN EXCLUSIVE TRANSACTION;") 
-        cur.execute("SELECT id FROM files WHERE filename = ?", (filename,))
-        if not cur.fetchone():
-            conn.rollback()
-            return "2PL Lock Aborted: Target file locked or non-existent."
-        log_audit_blockchain(username, action_type, '2PL_LOCKED_SUCCESS', filename)
-        conn.commit() 
-        return f"2PL Transaction Success: Serializability Enforced for '{filename}'."
-    except Exception as e:
-        conn.rollback()
-        return f"2PL Security Trigger: Transaction Aborted ({e})"
+        now = datetime.now(timezone.utc)
+        day_cutoff = (now - timedelta(days=6)).date().isoformat()
+        cur.execute("SELECT COUNT(*) FROM audit_logs WHERE action LIKE '%LOGIN%' AND (status LIKE '%DENIED%' OR status LIKE '%FAILED%' OR status LIKE '%LOCK%') AND datetime(timestamp)>=datetime('now','-24 hours')")
+        failed_logins = cur.fetchone()[0]
+        blocked_ips = cur.execute("SELECT COUNT(*) FROM firewall_rules").fetchone()[0]
+        active_sessions = cur.execute("SELECT COUNT(*) FROM active_sessions").fetchone()[0]
+        locked_accounts = cur.execute("SELECT COUNT(*) FROM users WHERE is_locked=1").fetchone()[0]
+        canary_alerts = cur.execute("SELECT COUNT(*) FROM audit_logs WHERE action='CANARY_ACCESS_ATTEMPT' AND timestamp>=?", ((now - timedelta(days=7)).isoformat(),)).fetchone()[0]
+        cur.execute("SELECT date(timestamp),COUNT(*) FROM audit_logs WHERE date(timestamp)>=? GROUP BY date(timestamp)", (day_cutoff,))
+        event_counts = {row[0]: row[1] for row in cur.fetchall()}
+        lockdown = is_emergency_lockdown_enabled(cur)
+        recent_events = [{"date": (now.date() - timedelta(days=i)).isoformat(),
+                          "count": event_counts.get((now.date() - timedelta(days=i)).isoformat(), 0)}
+                         for i in reversed(range(7))]
+        threat = "CRITICAL" if canary_alerts else "HIGH" if lockdown else "ELEVATED" if failed_logins or blocked_ips or locked_accounts else "NORMAL"
+        return {"threat_level": threat, "failed_logins_24h": failed_logins,
+                "blocked_addresses": blocked_ips, "active_sessions": active_sessions,
+                "locked_accounts": locked_accounts, "canary_alerts_7d": canary_alerts,
+                "events_by_day": recent_events}
     finally:
         conn.close()
 
-def create_security_checkpoint():
+def release_expired_temporary_locks():
+    """Clear expired temporary locks while retaining repeat-lockout history."""
+    now = datetime.now(timezone.utc)
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("PRAGMA wal_checkpoint(FULL);")
-    conn.close()
-    backup_path = os.path.join(BACKUP_DIR, "security_system_media_vault.db")
-    shutil.copyfile("security_system.db", backup_path)
-    return f"CHECKPOINT CREATED: Vault Updated at '{backup_path}'."
-
-def recover_from_media_failure():
-    backup_path = os.path.join(BACKUP_DIR, "security_system_media_vault.db")
-    if not os.path.exists(backup_path):
-        return "Media Recovery Error: No backup found!"
-    shutil.copyfile(backup_path, "security_system.db")
-    return "MEDIA RECOVERY EXECUTED: System restored successfully."
-
-def recover_from_system_crash():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT count(*) FROM audit_logs;")
-    logs_count = cur.fetchone()[0]
-    conn.close()
-    return f"CRASH RECOVERY COMPLETE: {logs_count} Audit logs recovered."
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, username, locked_until FROM users
+                       WHERE is_locked=1 AND permanently_locked=0 AND locked_until IS NOT NULL""")
+        expired = []
+        for user_id, username, locked_until in cur.fetchall():
+            try:
+                expires_at = datetime.fromisoformat(locked_until)
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                expires_at = now
+            if expires_at <= now:
+                expired.append((user_id, username))
+        for user_id, username in expired:
+            cur.execute("""UPDATE users SET is_locked=0, failed_attempts=0, locked_until=NULL
+                           WHERE id=? AND permanently_locked=0""", (user_id,))
+            insert_audit_record(cur, username, "TEMP_LOCK_EXPIRED", "AUTO_UNLOCKED", "")
+        conn.commit()
+        return len(expired)
+    finally:
+        conn.close()
 
 def calculate_file_hash(filepath):
+    """SHA-256 Integrity Hash to detect unauthorized file tampering"""
     if not os.path.exists(filepath):
         return None
     sha256 = hashlib.sha256()
@@ -361,32 +137,199 @@ def calculate_file_hash(filepath):
             while chunk := f.read(8192):
                 sha256.update(chunk)
         return sha256.hexdigest()
-    except:
+    except Exception:
         return None
 
-def verify_file_access_password(username, password):
+def log_audit(username, action, status, filename):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, username, password_hash, role FROM users WHERE LOWER(username) = LOWER(?)", (username,))
-        user = cur.fetchone()
+        cur.execute("BEGIN IMMEDIATE")
+        insert_audit_record(cur, username, action, status, filename)
+        conn.commit()
         conn.close()
-        if not user: return {"ok": False, "message": "User not found."}
-        user_id, db_username, stored_hash, role = user
-        valid = bcrypt.checkpw(password.encode('utf-8'), stored_hash.encode('utf-8')) if isinstance(stored_hash, str) else (password == stored_hash)
-        if valid: return {"ok": True, "id": user_id, "username": db_username, "role": role}
-        return {"ok": False, "message": "Invalid password."}
     except Exception as e:
-        return {"ok": False, "message": str(e)}
+        print(f"[AUDIT LOG ERROR]: {e}")
+
+def authenticate_login(username, password):
+    """Verify a login and enforce rolling temporary/permanent lockout policy."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("""SELECT id, password_hash, role, failed_attempts, is_locked,
+                             lockout_count, locked_until, permanently_locked
+                      FROM users WHERE username=?""", (username,))
+        user = cur.fetchone()
+        if not user:
+            conn.commit()
+            conn.close()
+            log_audit(username, "LOGIN", "DENIED_INVALID_USER", "")
+            return {"ok": False, "message": "Invalid username or password."}
+
+        user_id, password_hash, role, failures, locked, lockouts, locked_until, permanent = user
+        now = datetime.now(timezone.utc)
+
+        if role == "admin" and (permanent or (locked and not locked_until)):
+            cur.execute("""UPDATE users SET failed_attempts=0, lockout_count=0, is_locked=0,
+                          locked_until=NULL, permanently_locked=0 WHERE id=?""", (user_id,))
+            failures = lockouts = locked = permanent = 0
+            locked_until = None
+
+        if permanent:
+            conn.commit()
+            conn.close()
+            log_audit(username, "LOGIN", "DENIED_PERMANENT_LOCK", "")
+            return {"ok": False, "permanent": True,
+                    "message": "This account is permanently locked. Contact an administrator."}
+
+        if locked and locked_until:
+            try:
+                expires_at = datetime.fromisoformat(locked_until)
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+            except ValueError:
+                expires_at = now
+            if expires_at > now:
+                seconds = max(1, ceil((expires_at - now).total_seconds()))
+                conn.commit()
+                conn.close()
+                log_audit(username, "LOGIN", "DENIED_TEMPORARY_LOCK", "")
+                return {"ok": False, "locked": True,
+                        "message": f"Account temporarily locked. Try again in about {seconds} second(s)."}
+            cur.execute("UPDATE users SET is_locked=0, failed_attempts=0, locked_until=NULL WHERE id=?", (user_id,))
+            failures = 0
+        elif locked:
+            # Keep legacy locks closed until an admin explicitly resets them.
+            cur.execute("UPDATE users SET permanently_locked=1 WHERE id=?", (user_id,))
+            conn.commit()
+            conn.close()
+            log_audit(username, "LOGIN", "DENIED_PERMANENT_LOCK", "")
+            return {"ok": False, "permanent": True,
+                    "message": "This account is permanently locked. Contact an administrator."}
+
+        try:
+            valid_password = bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+        except (ValueError, TypeError, AttributeError):
+            valid_password = False
+
+        if not valid_password:
+            failures += 1
+            if failures >= MAX_FAILED_ATTEMPTS:
+                if role != "admin":
+                    lockouts += 1
+                if role != "admin" and lockouts >= PERMANENT_AFTER_LOCKOUTS:
+                    cur.execute("""UPDATE users SET failed_attempts=?, lockout_count=?, is_locked=1,
+                                   locked_until=NULL, permanently_locked=1 WHERE id=?""",
+                                (failures, lockouts, user_id))
+                    conn.commit()
+                    conn.close()
+                    log_audit(username, "LOGIN", "PERMANENTLY_LOCKED", "")
+                    return {"ok": False, "permanent": True,
+                            "message": "Account permanently locked after three lockouts. Contact an administrator."}
+                until = (now + timedelta(seconds=TEMPORARY_LOCK_SECONDS)).isoformat()
+                cur.execute("""UPDATE users SET failed_attempts=?, lockout_count=?, is_locked=1,
+                               locked_until=?, permanently_locked=0 WHERE id=?""",
+                            (failures, lockouts, until, user_id))
+                conn.commit()
+                conn.close()
+                log_audit(username, "LOGIN", "TEMPORARILY_LOCKED", "")
+                return {"ok": False, "locked": True,
+                        "message": "Three consecutive failed attempts. Login is blocked for 30 seconds."}
+            cur.execute("UPDATE users SET failed_attempts=? WHERE id=?", (failures, user_id))
+            conn.commit()
+            conn.close()
+            log_audit(username, "LOGIN", f"FAILED_ATTEMPT_{failures}_OF_3", "")
+            return {"ok": False,
+                    "message": f"Invalid username or password. {MAX_FAILED_ATTEMPTS - failures} attempt(s) remain before a 30-second lock."}
+
+        cur.execute("""UPDATE users SET failed_attempts=0, lockout_count=0,
+                      is_locked=0, locked_until=NULL WHERE id=?""", (user_id,))
+        conn.commit()
+        conn.close()
+        log_audit(username, "LOGIN", "SUCCESS", "")
+        return {"ok": True, "id": user_id, "username": username, "role": role}
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+
+def verify_file_access_password(username, password):
+    """Re-check a signed-in user's password without changing login lockout state."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, password_hash, role FROM users WHERE username=?", (username,))
+        user = cur.fetchone()
+        if not user:
+            return {"ok": False, "message": "Invalid username or password."}
+        user_id, password_hash, role = user
+        try:
+            valid = bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+        except (ValueError, TypeError, AttributeError):
+            valid = False
+        if not valid:
+            return {"ok": False, "message": "Invalid password. Login attempt counts are unchanged."}
+        return {"ok": True, "id": user_id, "username": username, "role": role}
+    finally:
+        conn.close()
+
+def authenticate_and_verify(username, password, filename):
+    login_result = verify_file_access_password(username, password)
+    if not login_result.get("ok"):
+        log_audit(username, "FILE_PASSWORD_CHECK", "DENIED_INVALID_PASSWORD", filename)
+        return login_result["message"]
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute("""SELECT id, role FROM users WHERE username = ?""", (username,))
+        user = cur.fetchone()
+
+        # 1. Invalid User Protection (No Crash)
+        if not user:
+            log_audit(username, 'UNAUTHORIZED_ACCESS', 'DENIED_INVALID_USER', filename)
+            conn.close()
+            return "ACCESS DENIED: Unknown User! Incident Logged in DBMS Audit."
+
+        user_id, role = user
+
+        # 4. SHA-256 Dynamic File Integrity Check
+        file_hash = calculate_file_hash(filename)
+        if not file_hash:
+            log_audit(username, 'FILE_VERIFY', 'FILE_MISSING', filename)
+            conn.close()
+            return f"SECURITY ERROR: Target file '{filename}' missing on disk!"
+
+        # 5. Role-Based Access Control (RBAC)
+        if role == 'admin':
+            log_audit(username, 'READ_FILE', 'ALLOWED_ADMIN', filename)
+            conn.close()
+            return f"ACCESS GRANTED [ADMIN]: SHA-256 Verified ({file_hash[:10]}...). Reading '{filename}'."
+
+        cur.execute("SELECT can_read FROM vw_active_security_permissions WHERE user_id = ? AND filename = ?", (user_id, filename))
+        perm = cur.fetchone()
+        conn.close()
+
+        if perm and perm[0] == 1:
+            log_audit(username, 'READ_FILE', 'ALLOWED_EMPLOYEE', filename)
+            return f"ACCESS GRANTED [EMPLOYEE]: SHA-256 Verified ({file_hash[:10]}...). Reading '{filename}'."
+        else:
+            log_audit(username, 'UNAUTHORIZED_FILE_ACCESS', 'DENIED_NO_PERM', filename)
+            return f"ACCESS DENIED: Employee '{username}' does NOT have permission for '{filename}'!"
+
+    except Exception as e:
+        return f"FAIL-SAFE TRIGGERED: Exception handled safely ({str(e)})"
 
 def admin_unlock_user(admin_user, target_user):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("UPDATE users SET failed_attempts = 0, is_locked = 0, locked_until = NULL WHERE username = ?", (target_user,))
+        cur.execute("""UPDATE users SET failed_attempts=0, lockout_count=0, is_locked=0,
+                      locked_until=NULL, permanently_locked=0 WHERE username=?""", (target_user,))
         conn.commit()
         conn.close()
-        log_audit_blockchain(admin_user, 'UNLOCK_ACCOUNT', 'SUCCESS', target_user)
-        return f"Account for '{target_user}' has been UNLOCKED."
+        log_audit(admin_user, 'UNLOCK_ACCOUNT', 'SUCCESS', target_user)
+        return f"ADMIN ACTION: Account for '{target_user}' has been UNLOCKED."
     except Exception as e:
-        return f"Unlock Failed: {e}"
+        return f"Admin Unlock Failed: {e}"
