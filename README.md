@@ -2,9 +2,10 @@
 
 **Aegis** is a Python/Flask file security platform that combines **DBMS**, **Operating System** and **application-security** concepts. It protects sensitive files with encryption, role-based access control, account lockouts, integrity checking and tamper-evident audit logging, all managed from a single-page web dashboard.
 
-🔗 **Live demo:** https://file-security-system-1.onrender.com
+🔗 **Live demo:** https://security-system-xeho.onrender.com
 
-> The demo runs on Render's hosting. If the service has been idle, the first load may take a short while to wake up.
+
+> The demo runs on Render's hosting. 
 
 ---
 
