@@ -103,13 +103,13 @@ def secure_os_read_stream(filepath, chunk_size=64 * 1024):
         raise
 
     class LockedFileStream:
-        def _init_(self):
-            self.closed = False
+    def __init__(self):
+        self.closed = False
 
-        def _iter_(self):
-            return self
+    def __iter__(self):
+        return self
 
-        def _next_(self):
+    def __next__(self):
             if self.closed:
                 raise StopIteration
             try:
